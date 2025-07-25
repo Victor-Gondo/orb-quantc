@@ -235,18 +235,18 @@ namespace QuantConnect.Algorithm.CSharp
             RelativeVolume = VolumeSMA.IsReady && VolumeSMA > 0 ? bar.Volume / VolumeSMA : null;
             VolumeSMA.Update(bar.EndTime, bar.Volume);
             OpeningBar = bar;
-            if (bar.Close >= bar.Open)
-            {
-                // bullish bar: use close as upper bound and open as lower
-                Upper = bar.Close;
-                Lower = bar.Open;
-            }
-            else
-            {
-                // bearish bar: use open as upper bound and close as lower
-                Upper = bar.Open;
-                Lower = bar.Close;
-            }
+            SetOpeningRange(bar);
+        }
+
+        private void SetOpeningRange(TradeBar bar)
+        {
+            // the opening range spans the entire candlestick including its wicks
+            // A bullish first bar defines range from its high down to its low
+            //   (top wick: High-Close, bottom wick: Open-Low)
+            // A bearish bar mirrors this logic
+            // Using High and Low captures both cases succinctly
+            Upper = bar.High;
+            Lower = bar.Low;
         }
 
         private void EntryHandler(TradeBar bar)
@@ -257,12 +257,14 @@ namespace QuantConnect.Algorithm.CSharp
 
             if (bar.Close > Upper)
             {
-                PlaceTrade(bar.Close, bar.Close - _algorithm.stopLossAtrDistance * ATR.Current.Value);
+                // break above opening range - enter at the range boundary
+                PlaceTrade(Upper, Upper - _algorithm.stopLossAtrDistance * ATR.Current.Value);
                 Reversed = false;
             }
             else if (bar.Close < Lower)
             {
-                PlaceTrade(bar.Close, bar.Close + _algorithm.stopLossAtrDistance * ATR.Current.Value);
+                // break below opening range - enter at the range boundary
+                PlaceTrade(Lower, Lower + _algorithm.stopLossAtrDistance * ATR.Current.Value);
                 Reversed = false;
             }
         }
@@ -277,7 +279,7 @@ namespace QuantConnect.Algorithm.CSharp
             {
                 EntryPrice = entryPrice;
                 Quantity = quantity;
-                EntryTicket = _algorithm.MarketOrder(_security.Symbol, quantity, false, tag: "Entry");
+                EntryTicket = _algorithm.LimitOrder(_security.Symbol, quantity, entryPrice, tag: "Entry");
             }
         }
 
