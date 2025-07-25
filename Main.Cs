@@ -61,6 +61,8 @@ namespace QuantConnect.Algorithm.CSharp
         private int _indicatorPeriod = 14; // days
         [Parameter("openingRangeMinutes")]
         private int _openingRangeMinutes = 3;       // when to place entries
+        [Parameter("entryBarMinutes")]
+        private int _entryBarMinutes = 1; // bar interval for entry confirmation
         [Parameter("stopLossAtrDistance")]      
         public decimal stopLossAtrDistance = 0.1m;  // distance for stop loss, fraction of ATR
         [Parameter("stopLossRiskSize")]
@@ -80,7 +82,6 @@ namespace QuantConnect.Algorithm.CSharp
 
         private int _leverage = 0;
         private Universe _universe;
-        private bool _entryPlaced = false;
         private int _maxLongPositions = 0;
         private int _maxShortPositions = 0;
         private int _maxPositions = 0;
@@ -121,7 +122,7 @@ namespace QuantConnect.Algorithm.CSharp
 
             Log(
                 $"MaxPositions={MaxPositions}, universeSize={_universeSize}, excludeETFs={_excludeETFs}, atrThreshold={_atrThreshold}, " +
-                $"indicatorPeriod={_indicatorPeriod}, openingRangeMinutes={_openingRangeMinutes}, stopLossAtrDistance={stopLossAtrDistance}, " + 
+                $"indicatorPeriod={_indicatorPeriod}, openingRangeMinutes={_openingRangeMinutes}, entryBarMinutes={_entryBarMinutes}, stopLossAtrDistance={stopLossAtrDistance}, " +
                 $"stopLossRiskSize={stopLossRiskSize}, reversing={reversing}, maximisePositions={_maximisePositions}, " + 
                 $"secondsResolution={_secondsResolution}, doubling={_doubling}, fees={_fees}"
             );
@@ -129,7 +130,6 @@ namespace QuantConnect.Algorithm.CSharp
         
         private void ResetVars()
         {
-            _entryPlaced = false;
             _maxLongPositions = 0;
             _maxShortPositions = 0;
             _maxPositions = 0;
@@ -149,7 +149,8 @@ namespace QuantConnect.Algorithm.CSharp
             // Add indicators for each asset that enters the universe.
             foreach (var security in changes.AddedSecurities)
             {
-                _symbolDataBySymbol[security.Symbol] = new SymbolData(this, security, _openingRangeMinutes, _indicatorPeriod);
+                _symbolDataBySymbol[security.Symbol] = new SymbolData(this, security,
+                    _openingRangeMinutes, _indicatorPeriod, _entryBarMinutes);
             }
         }
 
@@ -167,28 +168,13 @@ namespace QuantConnect.Algorithm.CSharp
             _maxPositions = Math.Max(_maxPositions, LongPositions + ShortPositions);
             _maxMarginUsed = Math.Max(_maxMarginUsed, Portfolio.TotalMarginUsed / Portfolio.TotalPortfolioValue);
 
-            if (IsWarmingUp || _entryPlaced) return;
-            if (!(Time.Hour == 9 && Time.Minute == 30 + _openingRangeMinutes)) return;
-            // Select the stocks in play.
-            var take = 1;
-            if (_maximisePositions == 1) take = 2;
-            var filtered = ActiveSecurities.Values
-                // Filter 1: Select assets in the unvierse that have a relative volume greater than 100%.
-                .Where(s => s.Price != 0 && _universe.Selected.Contains(s.Symbol)).Select(s => _symbolDataBySymbol[s.Symbol]).Where(s => s.RelativeVolume > 5 && s.ATR > _atrThreshold)
-                // Filter 2: Select the top 20 assets with the greatest relative volume.
-                .OrderByDescending(s => s.RelativeVolume).Take(MaxPositions*take);
-            // Look for trade entries.
-            foreach (var symbolData in filtered)
-            {
-                symbolData.Scan();
-            }
-            _entryPlaced = true;
+            if (IsWarmingUp) return;
         }
 
         public override void OnOrderEvent(OrderEvent orderEvent)
         {
             if (orderEvent.Status != OrderStatus.Filled) return;
-            _symbolDataBySymbol[orderEvent.Symbol].OnOrderEvent(orderEvent.Ticket);
+            _symbolDataBySymbol[orderEvent.Symbol].OnOrderEvent(orderEvent);
         }
 
         public void CheckToCancelRemainingEntries()
@@ -203,7 +189,7 @@ namespace QuantConnect.Algorithm.CSharp
                     if (symbolData.EntryTicket != null && symbolData.EntryTicket.Status == OrderStatus.Submitted)
                     {
                         symbolData.EntryTicket.Cancel();
-                        symbolData.EntryTicket = null;
+                        symbolData.ClearEntryTicket();
                     }
                 }
             }
@@ -216,7 +202,10 @@ namespace QuantConnect.Algorithm.CSharp
         public TradeBar OpeningBar = new();
         private OpeningRangeBreakoutUniverseAlgorithm _algorithm;
         private Security _security;
-        private IDataConsolidator Consolidator;
+        private IDataConsolidator _openingRangeConsolidator;
+        private IDataConsolidator _entryConsolidator;
+        public decimal Upper { get; private set; }
+        public decimal Lower { get; private set; }
         public AverageTrueRange ATR;
         private SimpleMovingAverage VolumeSMA;
         private decimal EntryPrice;
@@ -224,37 +213,50 @@ namespace QuantConnect.Algorithm.CSharp
         public OrderTicket EntryTicket, StopLossTicket;
         public bool Reversed = false;
 
-        public SymbolData(OpeningRangeBreakoutUniverseAlgorithm algorithm, Security security, int openingRangeMinutes, int indicatorPeriod) 
+        public SymbolData(OpeningRangeBreakoutUniverseAlgorithm algorithm,
+            Security security,
+            int openingRangeMinutes,
+            int indicatorPeriod,
+            int entryBarMinutes)
         {
             _algorithm = algorithm;
             _security = security;
-            Consolidator = algorithm.Consolidate(security.Symbol, TimeSpan.FromMinutes(openingRangeMinutes), ConsolidationHandler);
+            _openingRangeConsolidator = algorithm.Consolidate(security.Symbol,
+                TimeSpan.FromMinutes(openingRangeMinutes), OpeningRangeHandler);
+            _entryConsolidator = algorithm.Consolidate(security.Symbol,
+                TimeSpan.FromMinutes(entryBarMinutes), EntryHandler);
             ATR = algorithm.ATR(security.Symbol, indicatorPeriod, resolution: Resolution.Daily);
             VolumeSMA = new SimpleMovingAverage(indicatorPeriod);
         }
 
-        void ConsolidationHandler(TradeBar bar)
+        private void OpeningRangeHandler(TradeBar bar)
         {
             if (OpeningBar.Time.Date == bar.Time.Date) return;
-            // Update the asset's indicators and save the day's opening bar.
             RelativeVolume = VolumeSMA.IsReady && VolumeSMA > 0 ? bar.Volume / VolumeSMA : null;
             VolumeSMA.Update(bar.EndTime, bar.Volume);
             OpeningBar = bar;
+            Upper = bar.High;
+            Lower = bar.Low;
         }
 
-        public void Scan() {
-            // Calculate position sizes so that if you fill an order at the high (low) of the first 5-minute bar 
-            // and hit a stop loss based on 10% of the ATR, you only lose x% of portfolio value.
-            if (OpeningBar.Close > OpeningBar.Open)
+        private void EntryHandler(TradeBar bar)
+        {
+            if (OpeningBar.Time.Date != bar.Time.Date) return;
+            if (_algorithm.Portfolio[_security.Symbol].Invested || EntryTicket != null)
+                return;
+
+            if (bar.Close > Upper)
             {
-                PlaceTrade(OpeningBar.High, OpeningBar.High - _algorithm.stopLossAtrDistance * ATR);
+                PlaceTrade(bar.Close, bar.Close - _algorithm.stopLossAtrDistance * ATR.Current.Value);
+                Reversed = false;
             }
-            else if (OpeningBar.Close < OpeningBar.Open)
+            else if (bar.Close < Lower)
             {
-                PlaceTrade(OpeningBar.Low, OpeningBar.Low + _algorithm.stopLossAtrDistance * ATR);
+                PlaceTrade(bar.Close, bar.Close + _algorithm.stopLossAtrDistance * ATR.Current.Value);
+                Reversed = false;
             }
-            Reversed = false;
         }
+
 
         public void PlaceTrade(decimal entryPrice, decimal stopPrice)
         {
@@ -265,36 +267,35 @@ namespace QuantConnect.Algorithm.CSharp
             {
                 EntryPrice = entryPrice;
                 Quantity = quantity;
-                EntryTicket = _algorithm.StopMarketOrder(_security.Symbol, quantity, entryPrice, $"Entry");
+                EntryTicket = _algorithm.MarketOrder(_security.Symbol, quantity, false, tag: "Entry");
             }
         }
 
-        public void OnOrderEvent(OrderTicket orderTicket)
+        public void OnOrderEvent(OrderEvent orderEvent)
         {
-            // When the entry order is hit, place the exit order: Stop loss based on ATR.
-            if (orderTicket == EntryTicket)
+            if (orderEvent.OrderId == EntryTicket?.OrderId)
             {
-                // Calculate your trailing distance (absolute price, not percent)
-                // e.g. 10% of ATR:
                 var trailingDistance = _algorithm.stopLossAtrDistance * ATR.Current.Value;
-
-                // Place a trailing stop that will move up (for longs) or down (for shorts)
                 StopLossTicket = _algorithm.TrailingStopOrder(
                     _security.Symbol,
-                    -Quantity,             // flip the sign for the exit
-                    trailingDistance,      // how far away from the extreme price
-                    false,                 // false = trailingAmount is absolute, not percent
+                    -Quantity,
+                    trailingDistance,
+                    false,
                     tag: "Trailing Stop"
                 );
             }
 
-            // reverse position on stop loss. Will slip toom much in backtesting but stop orders could overuse margin
-            if (orderTicket == StopLossTicket && _algorithm.reversing == 1 && !Reversed)
+            if (orderEvent.OrderId == StopLossTicket?.OrderId && _algorithm.reversing == 1 && !Reversed)
             {
-                    _algorithm.MarketOrder(_security.Symbol, -Quantity, tag: "Reversed");
-                    StopLossTicket = _algorithm.StopMarketOrder(_security.Symbol, Quantity, EntryPrice, tag: "Reversed ATR Stop");
-                    Reversed = true;
+                _algorithm.MarketOrder(_security.Symbol, -Quantity, tag: "Reversed");
+                StopLossTicket = _algorithm.StopMarketOrder(_security.Symbol, Quantity, EntryPrice, tag: "Reversed ATR Stop");
+                Reversed = true;
             }
+        }
+
+        public void ClearEntryTicket()
+        {
+            EntryTicket = null;
         }
     }
 }
