@@ -235,8 +235,18 @@ namespace QuantConnect.Algorithm.CSharp
             RelativeVolume = VolumeSMA.IsReady && VolumeSMA > 0 ? bar.Volume / VolumeSMA : null;
             VolumeSMA.Update(bar.EndTime, bar.Volume);
             OpeningBar = bar;
-            Upper = bar.High;
-            Lower = bar.Low;
+            if (bar.Close >= bar.Open)
+            {
+                // bullish bar: use close as upper bound and open as lower
+                Upper = bar.Close;
+                Lower = bar.Open;
+            }
+            else
+            {
+                // bearish bar: use open as upper bound and close as lower
+                Upper = bar.Open;
+                Lower = bar.Close;
+            }
         }
 
         private void EntryHandler(TradeBar bar)
