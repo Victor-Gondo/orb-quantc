@@ -1,4 +1,0 @@
-quantconnect
-python-dateutil
-pandas
-numpy
